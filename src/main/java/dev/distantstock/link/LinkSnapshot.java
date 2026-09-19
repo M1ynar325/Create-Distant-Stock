@@ -1,6 +1,7 @@
 package dev.distantstock.link;
 
 import dev.distantstock.config.StockConfig;
+import dev.distantstock.routing.TowerReadout;
 import net.minecraft.server.MinecraftServer;
 
 /** 主线程写本端，io 线程写对端。HTTP / GUI / 护目镜只读。 */
@@ -19,6 +20,15 @@ public final class LinkSnapshot {
     public static volatile long peerSeenMs;
     public static volatile int peersUp;
     public static volatile int peersTotal;
+    public static volatile boolean transerverAttached;
+    public static volatile boolean transerverUp;
+    public static volatile String transerverNodeId = "";
+    public static volatile String transerverAlias = "";
+    public static volatile String transerverFailure = "";
+    public static volatile int transerverOutbox;
+    public static volatile int transerverInbox;
+    public static volatile int transerverCompleted;
+    public static volatile int transerverDeadLetters;
 
     private static long prevNano = System.nanoTime();
     private static double ewmaMspt = 50;
@@ -41,8 +51,41 @@ public final class LinkSnapshot {
         localMspt = ewmaMspt;
         localTps = ewmaMspt <= 0 ? 20 : Math.min(20.0, 1000.0 / ewmaMspt);
         orderDepth = LinkQueues.orderDepth();
-        packageDepth = LinkQueues.packageDepth();
-        inFlight = LinkQueues.inFlight();
+        packageDepth = LinkQueues.packageDepth() + transerverOutbox + transerverInbox;
+        inFlight = LinkQueues.inFlight() + ParcelEscrow.get(server).size();
+    }
+
+    /**
+     * How long a peer's numbers stay believable without a fresh word from it.
+     *
+     * <p>Two announcement periods: one lost message must not blank the reading, and a peer that has
+     * said nothing for two minutes is a peer whose numbers this server does not know. The screen
+     * shows a dash then rather than a zero — zero is a real measurement, and a link that is up but
+     * silent is not one.
+     */
+    public static final long PEER_STALE_MS = 120_000;
+
+    /** Whether anything has been heard from a peer recently enough to draw its numbers. */
+    public static boolean peerFresh() {
+        return peerSeenMs > 0 && System.currentTimeMillis() - peerSeenMs < PEER_STALE_MS;
+    }
+
+    /**
+     * A peer's own numbers, from the announcement it just sent.
+     *
+     * <p>The one source of a peer's TPS in Transerver mode. There is no HTTP polling on that
+     * transport — the announce is the only regular message that crosses — so a peer's metrics ride
+     * along with the network list rather than being asked for, which would need a second channel and
+     * a second round trip to say the same thing.
+     */
+    public static void peerMetrics(String node, double tps, double mspt) {
+        peerId = node == null ? "" : node;
+        peerTps = tps;
+        peerMspt = mspt;
+        peerSeenMs = System.currentTimeMillis();
+        peerUp = true;
+        peersUp = Math.max(peersUp, 1);
+        peersTotal = Math.max(peersTotal, 1);
     }
 
     public static void peersOk(int up, int total, String id, double tps, double mspt, long rttMs) {
@@ -70,6 +113,31 @@ public final class LinkSnapshot {
         }
     }
 
+    public static void transerver(String nodeId, String alias, boolean transportUp, String failure,
+                                  int outbox, int inbox, int completed, int deadLetters) {
+        transerverAttached = true;
+        transerverUp = transportUp;
+        transerverNodeId = nodeId == null ? "" : nodeId;
+        transerverAlias = alias == null ? transerverNodeId : alias;
+        transerverFailure = failure == null ? "" : failure;
+        transerverOutbox = outbox;
+        transerverInbox = inbox;
+        transerverCompleted = completed;
+        transerverDeadLetters = deadLetters;
+    }
+
+    public static void transerverUnavailable() {
+        transerverAttached = false;
+        transerverUp = false;
+        transerverNodeId = "";
+        transerverAlias = "";
+        transerverFailure = "";
+        transerverOutbox = 0;
+        transerverInbox = 0;
+        transerverCompleted = 0;
+        transerverDeadLetters = 0;
+    }
+
     public static String selfId() {
         return StockConfig.selfId();
     }
@@ -78,7 +146,18 @@ public final class LinkSnapshot {
         return view().linkLabel();
     }
 
+    /**
+     * The link half of the dashboard, for the callers that are not a monitor.
+     *
+     * <p>The tower readout is absent rather than looked up: it belongs to one monitor, and a process
+     * wide field for it would show the wrong tower for a tick every time two monitors were open.
+     */
     public static View view() {
+        return view(TowerReadout.NONE);
+    }
+
+    /** The same view with the readout of the monitor that is asking. */
+    public static View view(TowerReadout tower) {
         return new View(
                 selfId(),
                 peerId == null ? "" : peerId,
@@ -90,13 +169,30 @@ public final class LinkSnapshot {
                 peerUp,
                 peerTps,
                 peerMspt,
+                peerFresh(),
                 peerRttMs,
                 peerFails,
                 peersUp,
-                peersTotal
+                peersTotal,
+                transerverAttached,
+                transerverUp,
+                transerverNodeId,
+                transerverAlias,
+                transerverFailure,
+                transerverOutbox,
+                transerverInbox,
+                transerverCompleted,
+                transerverDeadLetters,
+                tower == null ? TowerReadout.NONE : tower
         );
     }
 
+    /**
+     * Everything a monitor screen draws.
+     *
+     * <p>The order of the components is the order of the wire; the last one was added as a whole
+     * record for that reason. See {@link dev.distantstock.routing.TowerReadout}.
+     */
     public record View(
             String selfId,
             String peerId,
@@ -108,12 +204,31 @@ public final class LinkSnapshot {
             boolean peerUp,
             double peerTps,
             double peerMspt,
+            boolean peerFresh,
             double peerRttMs,
             int peerFails,
             int peersUp,
-            int peersTotal
+            int peersTotal,
+            boolean transerverAttached,
+            boolean transerverUp,
+            String transerverNodeId,
+            String transerverAlias,
+            String transerverFailure,
+            int transerverOutbox,
+            int transerverInbox,
+            int transerverCompleted,
+            int transerverDeadLetters,
+            TowerReadout tower
     ) {
+        public boolean linkUp() {
+            return transerverAttached ? transerverUp : peerUp;
+        }
+
         public String linkLabel() {
+            if (transerverAttached) {
+                return (transerverAlias == null || transerverAlias.isBlank()
+                        ? transerverNodeId : transerverAlias) + (transerverUp ? " · online" : " · offline");
+            }
             if (peersTotal > 1) {
                 return selfId + " · " + peersUp + "/" + peersTotal;
             }

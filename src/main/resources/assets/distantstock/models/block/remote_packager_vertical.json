@@ -1,0 +1,10 @@
+{
+  "render_type": "minecraft:cutout",
+  "parent": "create:block/packager/block_vertical",
+  "textures": {
+    "0": "distantstock:block/remote_packager_frame_pale",
+    "1": "create:block/packager_details",
+    "5": "distantstock:block/remote_packager_vertical_unpowered_pale",
+    "particle": "distantstock:block/remote_packager_particle_pale"
+  }
+}

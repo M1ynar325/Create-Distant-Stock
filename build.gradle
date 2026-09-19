@@ -12,6 +12,12 @@ base {
 
 java.toolchain.languageVersion = JavaLanguageVersion.of(21)
 
+// Opt-in integration tests run in a separate world and are excluded from release jars.
+if (providers.gradleProperty('withGameTests').isPresent()) {
+    sourceSets.main.java.srcDir('src/gametest/java')
+    sourceSets.main.resources.srcDir('src/gametest/resources')
+}
+
 neoForge {
     version = neo_version
     runs {
@@ -20,11 +26,78 @@ neoForge {
         }
         server {
             server()
+            programArgument '--nogui'
+        }
+        // A second server, for the cross-server test: two nodes, one Router. Distant Stock's
+        // remote orders are the one thing no single-server game test can exercise, and nothing
+        // about the pair is special except the port and the game directory.
+        if (providers.gradleProperty('withPeerServer').isPresent()) {
+            serverPeer {
+                server()
+                // Out of build/ on purpose: this directory is a server — a world, a node identity,
+                // and the configs the cross-server test depends on — and build/ is deleted by
+                // `clean`, which the verification chain runs every time. It was lost that way once,
+                // mid-run, with the server still writing into a directory that no longer existed.
+                gameDirectory = file('devtest/server-peer')
+                programArgument '--port'
+                programArgument '25566'
+                programArgument '--nogui'
+            }
+        }
+        if (providers.gradleProperty('withGameTests').isPresent()) {
+            clientSmoke {
+                client()
+                gameDirectory = layout.buildDirectory.dir('client-smoke-run')
+                systemProperty 'distantstock.clientSmoke', 'true'
+            }
+            gameTestServer {
+                type = 'gameTestServer'
+                gameDirectory = layout.buildDirectory.dir('gametest-run')
+                systemProperty 'neoforge.enabledGameTestNamespaces', 'distantstock'
+                programArgument '--nogui'
+            }
         }
     }
     mods {
         "${mod_id}" {
             sourceSet(sourceSets.main)
+        }
+    }
+}
+
+if (providers.gradleProperty('withGameTests').isPresent()) {
+    /*
+     * Every run starts from an empty world.
+     *
+     * The game test world is a save like any other: it is written back at the end of a run and read
+     * again at the start of the next one. That makes cases depend on history — a tower left standing
+     * by one run is a tower that is already turning when the next run begins, and a running tower
+     * switches off every distant device outside its reach, which is half the suite. It cost an
+     * afternoon to find, twice, and the diagnostic that found it (owners=2 ticking) was only
+     * possible because the leftovers were real tickets in a real save.
+     */
+    tasks.named('runGameTestServer').configure {
+        def startedAt = 0L
+        doFirst {
+            startedAt = System.currentTimeMillis()
+            delete layout.buildDirectory.dir('gametest-run/world')
+        }
+        doLast {
+            def report = layout.buildDirectory.file('gametest-run/logs/latest.log').get().asFile
+            if (!report.exists() || report.lastModified() < startedAt
+                    || !(report.text =~ /All [1-9]\d* required tests passed/).find()
+                    || report.text.contains('required tests failed')) {
+                throw new GradleException('Game tests did not finish successfully; inspect build/gametest-run/logs/latest.log')
+            }
+        }
+    }
+    tasks.named('runClientSmoke').configure {
+        doLast {
+            def report = layout.buildDirectory.file('client-smoke-run/logs/latest.log').get().asFile
+            if (!report.exists() || !report.text.contains('DISTANTSTOCK_CLIENT_SMOKE_PASSED')
+                    || report.text.contains('DISTANTSTOCK_CLIENT_SMOKE_FAILED')) {
+                throw new GradleException('Client smoke test failed; inspect build/client-smoke-run/logs/latest.log')
+            }
         }
     }
 }
@@ -53,8 +126,37 @@ tasks.named('jar', Jar).configure {
     destinationDirectory = file('build')
 }
 
-def createJar = file("${System.getProperty('user.home')}/Documents/minecraft_launcher/.minecraft/versions/ES2_Firmament_1.21.1_9th_9.3.2_SunlightSignal/mods/create-1.21.1-6.0.10.jar")
+def modpackMods = file("${System.getProperty('user.home')}/Documents/minecraft_launcher/.minecraft/versions/ES2_Firmament_1.21.1_9th_9.3.2_SunlightSignal/mods")
+def createJar = new File(modpackMods, 'create-1.21.1-6.0.10.jar')
 def ponderJar = file("libs/ponder-neoforge-1.0.82+mc1.21.1.jar")
+def flywheelJar = file("libs/flywheel-neoforge-1.21.1-1.0.6.jar")
+def transerverJar = file("../Transerver/build/libs/Transerver-0.1.0-SNAPSHOT.jar")
+
+/*
+ * Create: Deployer API and Extra Gauges, from the same pack Create comes from.
+ *
+ * Deployer turns Create's factory panel into a board that can host panel types it does not know
+ * about, and Extra Gauges registers eight of them. Distant Stock's gauges and lamps are panels of
+ * the same kind, so the compatibility work has to be written against these two and checked with
+ * them loaded. Both are compile-only and optional at runtime: everything that touches them sits
+ * behind a ModList check, so a player with neither mod gets the fallback path rather than a crash.
+ */
+def deployerJar = new File(modpackMods, 'deployer-0.1.2.jar')
+def extraGaugesJar = new File(modpackMods, 'extra_gauges-2.1.2.jar')
+
+/*
+ * Create: Mobile Packages, loaded alongside rather than compiled against.
+ *
+ * Its 运输蜂停泊港 is where the dock-group membership screen comes from — a network with an owner,
+ * a list of players and a lock, which is the shape our dock groups already have — and it is worth
+ * having the original in the world while that screen is being written, to compare against rather
+ * than to remember. Nothing here names any of its classes, so it is runtime-only, and a machine
+ * without the pack simply does not load it.
+ *
+ * Runtime-only on purpose, unlike Deployer and Extra Gauges: those two are compiled against because
+ * our panels are registered into their registries, and this one is a reference, not a dependency.
+ */
+def mobilePackagesJar = new File(modpackMods, 'create_mobile_packages-1.21.1-0.7.4.jar')
 
 tasks.register('extractPonder') {
     onlyIf { !ponderJar.exists() }
@@ -69,15 +171,98 @@ tasks.register('extractPonder') {
     }
 }
 
+tasks.register('extractFlywheel') {
+    onlyIf { !flywheelJar.exists() }
+    doLast {
+        copy {
+            from zipTree(createJar)
+            include 'META-INF/jarjar/flywheel-neoforge-1.21.1-1.0.6.jar'
+            eachFile { it.path = it.name }
+            into 'libs'
+            includeEmptyDirs = false
+        }
+    }
+}
+
 tasks.named('compileJava').configure {
-    dependsOn 'extractPonder'
+    dependsOn 'extractPonder', 'extractFlywheel'
 }
 
 dependencies {
     compileOnly files(createJar)
+    runtimeOnly files(createJar)
     compileOnly files(ponderJar)
+    compileOnly files(flywheelJar)
+    compileOnly files(transerverJar)
+    runtimeOnly files(transerverJar)
+    if (deployerJar.exists()) {
+        compileOnly files(deployerJar)
+        runtimeOnly files(deployerJar)
+    }
+    if (extraGaugesJar.exists()) {
+        compileOnly files(extraGaugesJar)
+        runtimeOnly files(extraGaugesJar)
+    }
+    if (mobilePackagesJar.exists()) {
+        runtimeOnly files(mobilePackagesJar)
+    }
+}
+
+// The protocol and custody checks live in the test source set and need the game classes to build NBT tags.
+configurations.named('testCompileOnly').configure {
+    extendsFrom(configurations.getByName('modDevCompileDependencies'))
+}
+configurations.named('testRuntimeOnly').configure {
+    extendsFrom(configurations.getByName('modDevRuntimeDependencies'))
 }
 
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
+}
+
+tasks.register('verifyWireCodec', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.distantstock.link.PackageDispatchCodecCheck'
+}
+
+tasks.register('verifyParcelOwnership', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.distantstock.link.ParcelOwnershipCheck'
+}
+
+tasks.register('verifyClientAssets', Exec) {
+    group = 'verification'
+    description = 'Checks local block models, textures, and signal lamp variants.'
+    commandLine 'python3', 'scripts/verify_client_assets.py'
+}
+
+tasks.named('check').configure {
+    dependsOn 'verifyClientAssets'
+    dependsOn 'verifyPackagerParity'
+    dependsOn 'verifyDockMotion'
+    dependsOn 'verifyRequesterUnbind'
+}
+
+tasks.register('verifyRequesterUnbind', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.distantstock.item.RequesterUnbindCheck'
+}
+
+tasks.register('verifyDockMotion', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.distantstock.client.DockParcelMotionCheck'
+}
+
+tasks.register('verifyPackagerParity', Exec) {
+    group = 'verification'
+    description = 'Checks packager model and tray compatibility against the installed Create jar.'
+    commandLine 'python3', 'scripts/verify_packager_parity.py'
+}
+
+tasks.withType(Test).configureEach {
+    failOnNoDiscoveredTests = false
 }

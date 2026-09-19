@@ -1,5 +1,6 @@
 package dev.distantstock.block;
 
+import com.simibubi.create.content.equipment.wrench.IWrenchable;
 import com.mojang.serialization.MapCodec;
 import dev.distantstock.item.RequesterData;
 import dev.distantstock.item.RequesterItem;
@@ -39,16 +40,30 @@ import org.jetbrains.annotations.Nullable;
 
 import java.util.UUID;
 
-public final class GaugeBlock extends BaseEntityBlock {
+public final class GaugeBlock extends BaseEntityBlock implements IWrenchable {
+
+    /** Rotation would silently move the cabin or the panel slots, so a wrench click only reports state. */
+    @Override
+    public net.minecraft.world.InteractionResult onWrenched(net.minecraft.world.level.block.state.BlockState state,
+                                                            net.minecraft.world.item.context.UseOnContext context) {
+        return net.minecraft.world.InteractionResult.SUCCESS;
+    }
     public static final DirectionProperty FACING = HorizontalDirectionalBlock.FACING;
     public static final BooleanProperty LIT = BooleanProperty.create("lit");
     public static final MapCodec<GaugeBlock> CODEC = simpleCodec(GaugeBlock::new);
+    /**
+     * The console is floor-standing furniture, so its whole silhouette is solid.
+     *
+     * The head is a single box rather than a staircase following its -22.5 degree tilt: an
+     * AABB union cannot express the tilt, and a cheaper approximation would let players walk
+     * through the board. The head's real extent is y 9.02..16.99 by z 0.23..15.77, clipped
+     * here to the block. The antenna reaches y=25 and is deliberately left out, the same way
+     * the previous mast was.
+     */
     private static final VoxelShape NORTH = Shapes.or(
-            Block.box(0, 0, 0, 16, 3, 16),
-            Block.box(2, 3, 3, 14, 8, 14),
-            Block.box(1, 7, 2, 15, 10, 6),
-            Block.box(1, 7, 6, 15, 11, 10),
-            Block.box(1, 8, 10, 15, 13, 14));
+            Block.box(1, 0, 2, 15, 2, 15),
+            Block.box(3, 2, 6, 13, 12, 14),
+            Block.box(0, 9, 0, 16, 16, 16));
     private static final VoxelShape EAST = quarterTurn(NORTH);
     private static final VoxelShape SOUTH = quarterTurn(EAST);
     private static final VoxelShape WEST = quarterTurn(SOUTH);
@@ -123,12 +138,29 @@ public final class GaugeBlock extends BaseEntityBlock {
     @Override
     protected ItemInteractionResult useItemOn(ItemStack stack, BlockState state, Level level, BlockPos pos,
                                               Player player, InteractionHand hand, BlockHitResult hit) {
-        if (stack.getItem() instanceof RequesterItem && RequesterData.tuned(stack)) {
+        if (DockBlock.isWrench(stack)) {
+            return ItemInteractionResult.PASS_TO_DEFAULT_BLOCK_INTERACTION;
+        }
+        if (stack.getItem() instanceof RequesterItem) {
+            // Holding the terminal means configuring, never opening: the desk's own screen is what
+            // an empty hand is for. A player who came to point this desk at their network would
+            // otherwise get a menu and no binding, and would have to work out that the two gestures
+            // are one.
+            if (!RequesterData.tuned(stack)) {
+                if (!level.isClientSide) {
+                    RequesterItem.sayUntuned(player);
+                }
+                return ItemInteractionResult.sidedSuccess(level.isClientSide);
+            }
             if (!level.isClientSide && level.getBlockEntity(pos) instanceof GaugeBlockEntity be) {
                 be.setFreq(RequesterData.freq(stack));
                 if (!RequesterData.address(stack).isEmpty()) {
                     be.setAddress(RequesterData.address(stack));
                 }
+                // The receiving group travels with the rest of the binding: a desk pointed at a
+                // network but left on the default group would deliver into a system the player
+                // never chose.
+                RequesterData.receivingGroup(stack).ifPresent(be::setReceivingGroup);
                 player.displayClientMessage(Component.translatable("gui.distantstock.tuned")
                         .append(Component.literal(" " + RequesterData.shortFreq(be.freq()))), true);
             }
